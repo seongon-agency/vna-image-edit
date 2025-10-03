@@ -323,20 +323,246 @@ def progress_dashboard():
     else:
         st.error("Unable to load progress data")
 
+@st.cache_data(ttl=60)
+def get_posts_with_images():
+    """Get all unique posts (source URLs) with their associated images"""
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table("images").select("source_url, image_url, cdn_url, image_title, image_alt, id").execute()
+
+        if response.data:
+            df = pd.DataFrame(response.data)
+            # Group by source_url
+            posts = df.groupby('source_url').agg({
+                'id': 'count'
+            }).reset_index()
+            posts.columns = ['source_url', 'image_count']
+            posts = posts.sort_values('image_count', ascending=False)
+            return posts, df, None
+        else:
+            return pd.DataFrame(), pd.DataFrame(), "No data found"
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame(), str(e)
+
+def view_posts_page():
+    """Page to view posts and their before/after images"""
+    st.header("View Posts - Before/After Images")
+
+    # Load posts data
+    with st.spinner("Loading posts..."):
+        posts_df, images_df, error = get_posts_with_images()
+
+    if error:
+        st.error(f"Error loading posts: {error}")
+        return
+
+    if posts_df.empty:
+        st.warning("No posts found")
+        return
+
+    # Initialize session state for post navigation
+    if 'current_post_index' not in st.session_state:
+        st.session_state.current_post_index = 0
+    if 'search_query' not in st.session_state:
+        st.session_state.search_query = ""
+    if 'filtered_posts_df' not in st.session_state:
+        st.session_state.filtered_posts_df = posts_df.copy()
+
+    # Search bar with suggestions
+    st.subheader("Search Posts")
+
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        search_query = st.text_input(
+            "Search by URL",
+            value=st.session_state.search_query,
+            placeholder="Enter keywords to search in source URLs...",
+            label_visibility="collapsed"
+        )
+    with col2:
+        if st.button("Clear Search"):
+            st.session_state.search_query = ""
+            st.session_state.filtered_posts_df = posts_df.copy()
+            st.session_state.current_post_index = 0
+            st.rerun()
+
+    # Filter posts based on search
+    if search_query != st.session_state.search_query:
+        st.session_state.search_query = search_query
+        st.session_state.current_post_index = 0
+
+    if search_query:
+        filtered_posts = posts_df[posts_df['source_url'].str.contains(search_query, case=False, na=False)]
+        st.session_state.filtered_posts_df = filtered_posts
+
+        # Show search results count and suggestions
+        if len(filtered_posts) > 0:
+            st.info(f"Found {len(filtered_posts)} post(s) matching '{search_query}'")
+
+            # Show top 5 matching URLs as suggestions
+            if len(filtered_posts) > 1:
+                with st.expander("📋 See all matching posts", expanded=False):
+                    for idx, row in filtered_posts.iterrows():
+                        # Extract readable name from URL
+                        url_parts = row['source_url'].rstrip('/').split('/')
+                        url_name = url_parts[-1] if url_parts[-1] else url_parts[-2] if len(url_parts) > 1 else row['source_url']
+
+                        # Find the index in filtered list
+                        filtered_idx = filtered_posts.index.get_loc(idx)
+
+                        if st.button(f"{url_name} ({row['image_count']} images)", key=f"suggest_{idx}"):
+                            st.session_state.current_post_index = filtered_idx
+                            st.rerun()
+        else:
+            st.warning(f"No posts found matching '{search_query}'")
+            st.session_state.filtered_posts_df = posts_df.copy()
+    else:
+        st.session_state.filtered_posts_df = posts_df.copy()
+
+    # Use filtered posts
+    working_posts_df = st.session_state.filtered_posts_df
+
+    # Ensure index is valid for filtered results
+    if st.session_state.current_post_index >= len(working_posts_df):
+        st.session_state.current_post_index = 0
+
+    if len(working_posts_df) == 0:
+        st.warning("No posts to display")
+        return
+
+    # Display post selector
+    st.markdown("---")
+    st.subheader(f"Total Posts: {len(working_posts_df)}" + (f" (filtered from {len(posts_df)})" if search_query else ""))
+
+    # Navigation controls
+    col1, col2, col3, col4, col5 = st.columns([1, 1, 3, 1, 1])
+
+    with col1:
+        if st.button("⏮ First", disabled=(st.session_state.current_post_index == 0)):
+            st.session_state.current_post_index = 0
+            st.rerun()
+
+    with col2:
+        if st.button("◀ Previous", disabled=(st.session_state.current_post_index == 0)):
+            st.session_state.current_post_index -= 1
+            st.rerun()
+
+    with col3:
+        st.markdown(f"### Post {st.session_state.current_post_index + 1} of {len(working_posts_df)}")
+
+    with col4:
+        if st.button("Next ▶", disabled=(st.session_state.current_post_index >= len(working_posts_df) - 1)):
+            st.session_state.current_post_index += 1
+            st.rerun()
+
+    with col5:
+        if st.button("Last ⏭", disabled=(st.session_state.current_post_index >= len(working_posts_df) - 1)):
+            st.session_state.current_post_index = len(working_posts_df) - 1
+            st.rerun()
+
+    st.markdown("---")
+
+    # Get current post
+    current_post = working_posts_df.iloc[st.session_state.current_post_index]
+    current_source_url = current_post['source_url']
+
+    # Display post info
+    st.subheader("Post Information")
+    st.markdown(f"**Source URL:** [{current_source_url}]({current_source_url})")
+    st.markdown(f"**Total Images:** {current_post['image_count']}")
+
+    st.markdown("---")
+
+    # Get images for this post
+    post_images = images_df[images_df['source_url'] == current_source_url].reset_index(drop=True)
+
+    # Display images in before/after format
+    st.subheader("Images - Before/After Comparison")
+
+    # Add expand/collapse all buttons
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        if st.button("Expand All"):
+            for idx in range(len(post_images)):
+                st.session_state[f'expand_image_{idx}'] = True
+            st.rerun()
+    with col2:
+        if st.button("Collapse All"):
+            for idx in range(len(post_images)):
+                st.session_state[f'expand_image_{idx}'] = False
+            st.rerun()
+
+    st.markdown("---")
+
+    for idx, row in post_images.iterrows():
+        # Initialize session state for this image if not exists
+        if f'expand_image_{idx}' not in st.session_state:
+            st.session_state[f'expand_image_{idx}'] = False
+
+        # Create title for expander
+        title_text = f"Image {idx + 1}"
+        if pd.notna(row.get('image_title')):
+            title_text += f" - {row['image_title']}"
+
+        # Determine if CDN URL exists
+        has_cdn = pd.notna(row.get('cdn_url'))
+        status_indicator = "✅" if has_cdn else "⚠️"
+
+        with st.expander(f"{status_indicator} {title_text}", expanded=st.session_state[f'expand_image_{idx}']):
+            # Display metadata
+            if pd.notna(row.get('image_title')):
+                st.markdown(f"**Title:** {row['image_title']}")
+            if pd.notna(row.get('image_alt')):
+                st.markdown(f"**Alt Text:** {row['image_alt']}")
+
+            st.markdown("")  # Add spacing
+
+            # Display before/after images side by side
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("#### Before")
+                if pd.notna(row.get('image_url')):
+                    try:
+                        st.image(row['image_url'], use_container_width=True)
+                        st.caption(row['image_url'])
+                    except Exception as e:
+                        st.error(f"Failed to load image: {str(e)}")
+                        st.text(row['image_url'])
+                else:
+                    st.info("No original image URL")
+
+            with col2:
+                st.markdown("#### After")
+                if pd.notna(row.get('cdn_url')):
+                    try:
+                        st.image(row['cdn_url'], use_container_width=True)
+                        st.caption(row['cdn_url'])
+                    except Exception as e:
+                        st.error(f"Failed to load CDN image: {str(e)}")
+                        st.text(row['cdn_url'])
+                else:
+                    st.info("No CDN URL available")
+
+    # Add refresh button
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
+
 def main():
     st.title("Vietnam Airlines Image Database Editor")
 
     # Add navigation
     page = st.selectbox(
         "Select Mode",
-        ["Progress Dashboard", "Review Images", "Browse Data"],
+        ["View Posts", "Review Images"],
         index=0
     )
 
     st.markdown("---")
 
-    if page == "Progress Dashboard":
-        progress_dashboard()
+    if page == "View Posts":
+        view_posts_page()
         return
 
     # Initialize session state for pagination
